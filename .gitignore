@@ -1,0 +1,25 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+env/
+venv/
+
+# Data
+data_raw/
+data_parsed/
+index/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Notebooks checkpoints
+.ipynb_checkpoints/
+
+# Logs
+*.log
