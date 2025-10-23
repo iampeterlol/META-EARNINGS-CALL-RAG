@@ -1,5 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 query_meta_rag.py
 Simple retrieval demo over Meta earnings-call transcripts.
