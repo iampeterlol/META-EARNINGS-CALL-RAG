@@ -54,19 +54,19 @@ def main():
         context = build_context(retrieved)
 
         prompt = f"""
-You are a financial analyst assistant.
-Using the excerpts from Meta's earnings call transcripts below,
-answer the question and cite which quarter(s) your evidence came from.
+            You are a financial analyst assistant.
+            Using the excerpts from Meta's earnings call transcripts below,
+            answer the question and cite which quarter(s) your evidence came from.
 
-Context:
-{context}
+            Context:
+            {context}
 
-Question: {q}
-"""
+            Question: {q}
+            """
 
         print("Calling Gemini...")
         response = model.generate_content(prompt)
-        print("\Gemini Answer:\n")
+        print("Gemini Answer:\n")
         print(response.text)
         print("\n" + "-" * 80)
 
