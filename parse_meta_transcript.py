@@ -57,12 +57,13 @@ def parse_one(path: str, year: int, quarter: str) -> List[Dict]:
     chunks = chunk_sentences(sents)
     out = []
     for i, ch in enumerate(chunks, 1):
+        prefix = f"[META | YEAR={year} | QUARTER={quarter}] "
         out.append({
             "chunk_id": f"META_{year}{quarter}_{i:04d}",
             "ticker": "META",
             "fiscal_year": year,
             "fiscal_quarter": quarter,
-            "text": ch,
+            "text": prefix + ch,   # inject prefix
             "source_file": os.path.basename(path)
         })
     return out
@@ -74,7 +75,7 @@ def main():
     print(f"[info] found {len(pdfs)} PDF files")
 
     for p in pdfs:
-        m = re.search(r"Q([1-4])[-_]?(\d{4})", p)
+        m = re.search(r"Q([1-4])[-_']?(\d{2,4})", p)
         if not m:
             print(f"[skip] cannot parse quarter/year: {p}")
             continue

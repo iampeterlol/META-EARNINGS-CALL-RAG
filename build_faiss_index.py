@@ -27,7 +27,9 @@ def main():
 
     emb = model.encode(texts, normalize_embeddings=True, show_progress_bar=True).astype("float32")
     dim = emb.shape[1]
-    index = faiss.IndexHNSWFlat(dim, 32)
+    # index = faiss.IndexHNSWFlat(dim, 32)
+    index = faiss.IndexHNSWFlat(dim, 32, faiss.METRIC_INNER_PRODUCT)  # use cosine similarity
+
     index.hnsw.efConstruction = 200
     index.add(emb)
 
