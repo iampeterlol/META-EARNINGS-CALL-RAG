@@ -184,23 +184,96 @@ def query_rag(question, model, index, ids, meta):
 
 # ================= Streamlit UI =================
 st.set_page_config(page_title="Meta Earnings Call Analyst", layout="wide")
-st.title("💬 Meta Earnings Call Analyst (Gemini-powered)")
 
-question = st.text_input("Enter your question:", placeholder="e.g. What did Meta say about AI investment in 2024?")
-run = st.button("🔍 Search")
+# ---------- Sidebar ----------
+with st.sidebar:
+    st.header("⚙️ Settings & Info")
+    st.markdown(f"**Embedding Model:** `{EMB_MODEL}`")
+    st.markdown(f"**LLM Model:** `{GENAI_MODEL}`")
+    st.markdown("---")
 
-if run and question.strip():
-    with st.spinner("Retrieving and summarizing with Gemini..."):
-        model, index, ids, meta = load_resources()
-        answer, retrieved = query_rag(question, model, index, ids, meta)
+    if st.button("🧹 Clear chat"):
+        st.session_state["history"] = []
+        st.experimental_rerun()
 
-    st.markdown("### 🧠 Gemini Answer")
-    st.write(re.sub(r'\$', r'\\$', answer))
+    show_context = st.checkbox("Show retrieved context", value=True)
+    save_logs = st.checkbox("Auto-save chats to file", value=True)
+    st.markdown("---")
+    st.caption("💡 Example: *“What were Meta’s capex priorities in 2023?”*")
 
-    with st.expander("📚 Retrieved Context"):
-        for i, doc in enumerate(retrieved, 1):
-            if "score" in doc:
-                st.caption(f"Relevance Score: {doc['score']:.2f}")
-            st.markdown(f"**{i}. {doc['fiscal_quarter']} {doc['fiscal_year']}** — *{doc['source_file']}*")
-            st.write(re.sub(r'\$', r'\\$', doc["text"]))
-            st.markdown("---")
+# ---------- Session init ----------
+if "history" not in st.session_state:
+    st.session_state["history"] = []  # stores [{"role": "user"/"assistant", "content": str, "retrieved": list}]
+
+st.title("💬 Meta Earnings Call Analyst")
+
+# ---------- Display existing conversation ----------
+for chat in st.session_state["history"]:
+    with st.chat_message(chat["role"]):
+        st.markdown(chat["content"])
+
+# ---------- Handle new user input ----------
+if prompt := st.chat_input("Ask a question about Meta’s earnings calls..."):
+
+    # Display user message
+    with st.chat_message("user"):
+        st.markdown(prompt)
+    st.session_state["history"].append({"role": "user", "content": prompt, "retrieved": []})
+
+    # Combine recent assistant replies as context for multi-turn RAG
+    past_context = "\n\n".join(
+        f"Q: {h['content']}\nA: {h['content']}"
+        for h in st.session_state["history"][-4:]  # last 4 turns
+        if h["role"] == "assistant"
+    )
+
+    full_query = prompt
+    if past_context:
+        full_query = f"Previous conversation:\n{past_context}\n\nUser's new question:\n{prompt}"
+
+    # Retrieve and answer
+    with st.chat_message("assistant"):
+        with st.spinner("Retrieving and summarizing with Gemini..."):
+            model, index, ids, meta = load_resources()
+            try:
+                answer, retrieved = query_rag(full_query, model, index, ids, meta)
+            except Exception as e:
+                st.error(f"⚠️ Retrieval or LLM error: {e}")
+                answer, retrieved = "Sorry, something went wrong.", []
+
+        st.markdown(answer)
+        st.session_state["history"].append({
+            "role": "assistant",
+            "content": answer,
+            "retrieved": retrieved
+        })
+
+        # ----- save to disk -----
+        if save_logs:
+            import json, datetime, os
+            os.makedirs("chat_logs", exist_ok=True)
+            log_path = "chat_logs/meta_chatlog.jsonl"
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "timestamp": datetime.datetime.now().isoformat(),
+                    "user_query": prompt,
+                    "assistant_answer": answer,
+                    "retrieved_chunks": [
+                        {
+                            "file": d.get("source_file"),
+                            "fiscal_year": d.get("fiscal_year"),
+                            "fiscal_quarter": d.get("fiscal_quarter"),
+                            "score": d.get("score", 0)
+                        }
+                        for d in retrieved
+                    ]
+                }, ensure_ascii=False) + "\n")
+
+        # ----- Show retrieved context -----
+        if show_context and retrieved:
+            with st.expander("📚 Retrieved Context"):
+                for i, doc in enumerate(retrieved, 1):
+                    st.caption(f"Relevance Score: {doc.get('score', 0):.2f}")
+                    st.markdown(f"**{i}. {doc['fiscal_quarter']} {doc['fiscal_year']}** — *{doc['source_file']}*")
+                    st.write(re.sub(r'\$', r'\\$', doc.get('text', '')))
+                    st.markdown("---")
