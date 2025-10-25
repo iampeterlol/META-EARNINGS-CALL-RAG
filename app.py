@@ -8,6 +8,7 @@ from sentence_transformers import SentenceTransformer
 from dotenv import load_dotenv
 import google.generativeai as genai
 import re
+import datetime
 
 # ========== CONFIG ==========
 load_dotenv()
@@ -21,6 +22,27 @@ TOP_K = 10
 GENAI_MODEL = "gemini-2.0-flash"
 # ============================
 
+def summarize_history_for_context(history, max_turns=4):
+    """
+    Build a concise conversation summary from the last few turns.
+    Returns text like:
+    'User previously asked about ... Gemini replied that ...'
+    """
+    if not history:
+        return ""
+    relevant = [h for h in history if h["role"] in ("user", "assistant")][-max_turns*2:]
+    pairs = []
+    q = None
+    for h in relevant:
+        if h["role"] == "user":
+            q = h["content"]
+        elif h["role"] == "assistant" and q:
+            pairs.append((q, h["content"]))
+            q = None
+    summary_lines = []
+    for i, (u, a) in enumerate(pairs, 1):
+        summary_lines.append(f"Turn {i}: User asked '{u}' → Assistant answered '{a[:200]}...'")
+    return "\n".join(summary_lines)
 
 @st.cache_resource(show_spinner=False)
 def load_resources():
@@ -106,8 +128,8 @@ def infer_quarter_year(r: dict) -> str:
 
     return ""
 
-def query_rag(question, model, index, ids, meta):
-    """Generic RAG retrieval with dynamic constraints (year/quarter/topic)."""
+def query_rag(question, model, index, ids, meta, conversation_summary=""):
+    """Generic RAG retrieval with dynamic constraints (year/quarter/topic) and optional conversation context summary."""
     index.hnsw.efSearch = 256
     TOP_K_RAW = 400
     TOP_K_FINAL = 10
@@ -124,6 +146,10 @@ def query_rag(question, model, index, ids, meta):
     if kwds:
         boost += " [keywords: " + ", ".join(sorted(kwds)) + "]"
 
+    # === 加入对话摘要到查询向量 ===
+    if conversation_summary:
+        boost = f"Previous conversation:\n{conversation_summary}\n\nUser's new question:\n{boost}"
+
     qv = model.encode([boost], normalize_embeddings=True).astype("float32")
     D, I = index.search(qv, TOP_K_RAW)
     cands = [meta[ids[i]] | {"score": float(D[0][j])} for j, i in enumerate(I[0])]
@@ -131,10 +157,12 @@ def query_rag(question, model, index, ids, meta):
     # --- soft filter by constraints
     def infer_year(r):
         y = r.get("fiscal_year")
-        if isinstance(y, int): return y
+        if isinstance(y, int):
+            return y
         try:
             return int(str(y)[:4])
-        except: return None
+        except:
+            return None
 
     def infer_quarter(r):
         q = str(r.get("fiscal_quarter", "")).upper()
@@ -166,11 +194,14 @@ def query_rag(question, model, index, ids, meta):
     ):
         return "Sorry, the requested year/quarter information is not present in the indexed transcripts.", cands
 
-    # build context for LLM
+    # === 构建包含上下文的 LLM prompt ===
     context = build_context(retrieved)
     prompt = f"""
         You are a financial analyst assistant.
         Use only the excerpts below. If the answer isn't in them, say so.
+
+        Conversation so far:
+        {conversation_summary if conversation_summary else "(no prior context)"}
 
         Context:
         {context}
@@ -181,31 +212,155 @@ def query_rag(question, model, index, ids, meta):
     resp = gemini.generate_content(prompt)
     return resp.text, retrieved
 
+import datetime
+
+# ========== Chat session utilities ==========
+def list_chat_sessions():
+    """List all saved chat sessions."""
+    os.makedirs("chat_logs", exist_ok=True)
+    files = sorted(
+        [f for f in os.listdir("chat_logs") if f.endswith(".json")],
+        key=lambda x: os.path.getmtime(os.path.join("chat_logs", x)),
+        reverse=True
+    )
+    return files
+
+def load_chat(filename):
+    """Load a chat session."""
+    path = os.path.join("chat_logs", filename)
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def save_chat(filename, title, history):
+    """Save a chat session."""
+    path = os.path.join("chat_logs", filename)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"title": title, "history": history}, f, ensure_ascii=False, indent=2)
+
+def new_chat_filename(title="New Chat"):
+    """Generate a unique filename."""
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_title = title.replace(" ", "_")[:40]
+    return f"chat_{ts}_{safe_title}.json"
+
+def generate_chat_title(prompt):
+    """Generate a concise title (remove extra 'options', punctuation, etc.)."""
+    try:
+        gemini = genai.GenerativeModel(GENAI_MODEL)
+        msg = f"Generate a single short, specific title (4–6 words) summarizing this question: '{prompt}'. Do not include 'Here are options' or multiple bullets."
+        resp = gemini.generate_content(msg)
+        raw_title = resp.text.strip()
+
+        # 清理换行、冒号、列表符号等
+        title = re.split(r'[\n:*•\-–]', raw_title)[0]
+        title = re.sub(r'["*_`]+', '', title)  # 去除符号
+        title = re.sub(r'\s+', ' ', title).strip()
+        title = title.replace("Here are a few options", "").strip()
+
+        # 限制长度并大写首字母
+        if len(title) > 80:
+            title = title[:80]
+        title = title[:1].upper() + title[1:] if title else "New Chat"
+        return title or "New Chat"
+
+    except Exception as e:
+        print(f"[warn] title generation failed: {e}")
+        return "New Chat"
 
 # ================= Streamlit UI =================
 st.set_page_config(page_title="Meta Earnings Call Analyst", layout="wide")
 
 # ---------- Sidebar ----------
 with st.sidebar:
-    st.header("⚙️ Settings & Info")
-    st.markdown(f"**Embedding Model:** `{EMB_MODEL}`")
-    st.markdown(f"**LLM Model:** `{GENAI_MODEL}`")
-    st.markdown("---")
+    st.header("🗂️ Chat Sessions")
 
-    if st.button("🧹 Clear chat"):
+    sessions = list_chat_sessions()
+    if "current_chat" not in st.session_state:
+        st.session_state["current_chat"] = sessions[0] if sessions else None
+    if "chat_title" not in st.session_state:
+        st.session_state["chat_title"] = "New Chat"
+    if "history" not in st.session_state:
         st.session_state["history"] = []
+
+    # selected_chat = st.selectbox("Select chat session", options=[""] + sessions, index=(sessions.index(st.session_state["current_chat"]) + 1) if st.session_state["current_chat"] in sessions else 0)
+    # Build mapping of filename to title (for cleaner dropdown display)
+    chat_titles = {}
+    for f in sessions:
+        try:
+            data = load_chat(f)
+            title = data.get("title", f)
+            # 简化标题显示（去掉 chat_时间戳_ 之类）
+            clean_title = re.sub(r"^chat_\d{8}_\d{6}_", "", f)
+            chat_titles[f] = title or clean_title
+        except Exception:
+            chat_titles[f] = f
+
+    # 构建下拉选项显示
+    options_display = [""] + [chat_titles[f] for f in sessions]
+    selected_display = st.selectbox("Select chat session", options=options_display)
+
+    # 找到被选中的文件名
+    if selected_display:
+        selected_chat = [k for k, v in chat_titles.items() if v == selected_display][0]
+    else:
+        selected_chat = ""
+
+    col1, col2, col3 = st.columns([1,1,1])
+    with col1:
+        if st.button("➕ New Chat"):
+            st.session_state["history"] = []
+            st.session_state["current_chat"] = None
+            st.session_state["chat_title"] = "New Chat"
+            st.experimental_rerun()
+    with col2:
+        if st.button("💾 Save Chat"):
+            if st.session_state["current_chat"]:
+                save_chat(st.session_state["current_chat"], st.session_state.get("chat_title", "New Chat"), st.session_state["history"])
+                st.success(f"Chat saved as {st.session_state['current_chat']}")
+            else:
+                # save as new file
+                filename = new_chat_filename(st.session_state.get("chat_title", "New Chat"))
+                save_chat(filename, st.session_state.get("chat_title", "New Chat"), st.session_state["history"])
+                st.session_state["current_chat"] = filename
+                st.success(f"Chat saved as {filename}")
+    with col3:
+        if st.button("🗑️ Delete Chat"):
+            if st.session_state["current_chat"]:
+                try:
+                    os.remove(os.path.join("chat_logs", st.session_state["current_chat"]))
+                    st.success(f"Deleted {st.session_state['current_chat']}")
+                    st.session_state["current_chat"] = None
+                    st.session_state["history"] = []
+                    st.session_state["chat_title"] = "New Chat"
+                    st.experimental_rerun()
+                except Exception as e:
+                    st.error(f"Failed to delete chat: {e}")
+
+    if selected_chat != "" and selected_chat != st.session_state.get("current_chat"):
+        # Load selected chat
+        data = load_chat(selected_chat)
+        st.session_state["history"] = data.get("history", [])
+        st.session_state["chat_title"] = data.get("title", "New Chat")
+        st.session_state["current_chat"] = selected_chat
         st.experimental_rerun()
 
     show_context = st.checkbox("Show retrieved context", value=True)
     save_logs = st.checkbox("Auto-save chats to file", value=True)
     st.markdown("---")
     st.caption("💡 Example: *“What were Meta’s capex priorities in 2023?”*")
+    st.markdown("---")
+
+    st.header("⚙️ Settings & Info")
+    st.markdown(f"**Embedding Model:** `{EMB_MODEL}`")
+    st.markdown(f"**LLM Model:** `{GENAI_MODEL}`")
 
 # ---------- Session init ----------
 if "history" not in st.session_state:
     st.session_state["history"] = []  # stores [{"role": "user"/"assistant", "content": str, "retrieved": list}]
+if "chat_title" not in st.session_state:
+    st.session_state["chat_title"] = "New Chat"
 
-st.title("💬 Meta Earnings Call Analyst")
+st.title(f"💬 Meta Earnings Call Analyst")
 
 # ---------- Display existing conversation ----------
 for chat in st.session_state["history"]:
@@ -236,9 +391,11 @@ if prompt := st.chat_input("Ask a question about Meta’s earnings calls..."):
         with st.spinner("Retrieving and summarizing with Gemini..."):
             model, index, ids, meta = load_resources()
             try:
-                answer, retrieved = query_rag(full_query, model, index, ids, meta)
+                # answer, retrieved = query_rag(full_query, model, index, ids, meta)
+                answer, retrieved = query_rag(prompt, model, index, ids, meta,
+                                             conversation_summary=summarize_history_for_context(st.session_state["history"]))
             except Exception as e:
-                st.error(f"⚠️ Retrieval or LLM error: {e}")
+                st.error(f"Retrieval or LLM error: {e}")
                 answer, retrieved = "Sorry, something went wrong.", []
 
         st.markdown(answer)
@@ -269,8 +426,24 @@ if prompt := st.chat_input("Ask a question about Meta’s earnings calls..."):
                     ]
                 }, ensure_ascii=False) + "\n")
 
+        # ----- Auto-generate title and save current chat -----
+        if st.session_state["chat_title"] == "New Chat" and st.session_state["history"]:
+            # generate title from first user prompt
+            first_user_prompt = next((h["content"] for h in st.session_state["history"] if h["role"] == "user"), None)
+            if first_user_prompt:
+                title = generate_chat_title(first_user_prompt)
+                st.session_state["chat_title"] = title
+
+        if st.session_state.get("current_chat"):
+            save_chat(st.session_state["current_chat"], st.session_state.get("chat_title", "New Chat"), st.session_state["history"])
+        else:
+            # Save as new file
+            filename = new_chat_filename(st.session_state.get("chat_title", "New Chat"))
+            save_chat(filename, st.session_state.get("chat_title", "New Chat"), st.session_state["history"])
+            st.session_state["current_chat"] = filename
+
         # ----- Show retrieved context -----
-        if show_context and retrieved:
+        if show_context and retrieved and "not present in the indexed transcripts" not in answer.lower():
             with st.expander("📚 Retrieved Context"):
                 for i, doc in enumerate(retrieved, 1):
                     st.caption(f"Relevance Score: {doc.get('score', 0):.2f}")
